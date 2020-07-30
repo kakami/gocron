@@ -49,19 +49,17 @@ func (s *Scheduler) ChangeLoc(newLocation *time.Location) {
 }
 
 // Get the current runnable jobs, which shouldRun is True
-func (s *Scheduler) getRunnableJobs() (runningJobs [MAXJOBNUM]*Job, n int) {
-	runnableJobs := [MAXJOBNUM]*Job{}
-	n = 0
+func (s *Scheduler) getRunnableJobs() []*Job {
+	var jobs []*Job
 	sort.Sort(s)
 	for i := 0; i < s.size; i++ {
 		if s.jobs[i].shouldRun() {
-			runnableJobs[n] = s.jobs[i]
-			n++
+			jobs = append(jobs, s.jobs[i])
 		} else {
 			break
 		}
 	}
-	return runnableJobs, n
+	return jobs
 }
 
 // NextRun datetime when the next job should run.
@@ -83,13 +81,12 @@ func (s *Scheduler) Every(interval uint64) *Job {
 
 // RunPending runs all the jobs that are scheduled to run.
 func (s *Scheduler) RunPending() {
-	runnableJobs, n := s.getRunnableJobs()
-
-	if n != 0 {
-		for i := 0; i < n; i++ {
-			go runnableJobs[i].run()
-			runnableJobs[i].lastRun = time.Now()
-			runnableJobs[i].scheduleNextRun()
+	jobs := s.getRunnableJobs()
+	if jobs != nil {
+		for _, j := range jobs {
+			go j.run()
+			j.lastRun = time.Now()
+			j.scheduleNextRun()
 		}
 	}
 }
