@@ -2,37 +2,76 @@ package gocron
 
 import (
 	"sort"
+	"sync"
 	"time"
 )
 
 // Scheduler struct, the only data member is the list of jobs.
 // - implements the sort.Interface{} for sorting jobs, by the time nextRun
 type Scheduler struct {
-	jobs [MAXJOBNUM]*Job // Array store jobs
-	size int             // Size of jobs which jobs holding.
-	loc  *time.Location  // Location to use when scheduling jobs with specified times
+	jobs []*Job // Array store jobs
+	mu   sync.RWMutex
+
+	running  bool
+	stopChan chan struct{}
 }
 
-var (
-	defaultScheduler = NewScheduler()
-)
-
-// NewScheduler creates a new scheduler
+// NewScheduler creates a new Scheduler
 func NewScheduler() *Scheduler {
 	return &Scheduler{
-		jobs: [MAXJOBNUM]*Job{},
-		size: 0,
-		loc:  loc,
+		jobs:     make([]*Job, 0),
+		running:  false,
+		stopChan: make(chan struct{}),
 	}
+}
+
+func (s *Scheduler) Start() {
+	<-s.StartAsync()
+}
+
+func (s *Scheduler) StartAsync() chan struct{} {
+	if s.running {
+		return s.stopChan
+	}
+
+	s.running = true
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				s.runPending()
+			case <-s.stopChan:
+				ticker.Stop()
+				s.running = false
+				return
+			}
+		}
+	}()
+
+	return s.stopChan
+}
+
+func (s *Scheduler) Stop() {
+	if s.running {
+		s.stopScheduler()
+	}
+}
+
+func (s *Scheduler) stopScheduler() {
+	s.stopChan <- struct{}{}
 }
 
 // Jobs returns the list of Jobs from the Scheduler
 func (s *Scheduler) Jobs() []*Job {
-	return s.jobs[:s.size]
+	s.mu.RLock()
+	jobs := s.jobs
+	s.mu.RUnlock()
+	return jobs
 }
 
 func (s *Scheduler) Len() int {
-	return s.size
+	return len(s.jobs)
 }
 
 func (s *Scheduler) Swap(i, j int) {
@@ -43,18 +82,13 @@ func (s *Scheduler) Less(i, j int) bool {
 	return s.jobs[j].nextRun.Unix() >= s.jobs[i].nextRun.Unix()
 }
 
-// ChangeLoc changes the default time location
-func (s *Scheduler) ChangeLoc(newLocation *time.Location) {
-	s.loc = newLocation
-}
-
 // Get the current runnable jobs, which shouldRun is True
-func (s *Scheduler) getRunnableJobs() []*Job {
+func (s *Scheduler) runnableJobs() []*Job {
 	var jobs []*Job
 	sort.Sort(s)
-	for i := 0; i < s.size; i++ {
-		if s.jobs[i].shouldRun() {
-			jobs = append(jobs, s.jobs[i])
+	for _, job := range s.jobs {
+		if s.shouldRun(job) {
+			jobs = append(jobs, job)
 		} else {
 			break
 		}
@@ -64,7 +98,9 @@ func (s *Scheduler) getRunnableJobs() []*Job {
 
 // NextRun datetime when the next job should run.
 func (s *Scheduler) NextRun() (*Job, time.Time) {
-	if s.size <= 0 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.jobs) == 0 {
 		return nil, time.Now()
 	}
 	sort.Sort(s)
@@ -72,22 +108,31 @@ func (s *Scheduler) NextRun() (*Job, time.Time) {
 }
 
 // Every schedule a new periodic job with interval
-func (s *Scheduler) Every(interval uint64) *Job {
-	job := NewJob(interval).Loc(s.loc)
-	s.jobs[s.size] = job
-	s.size++
+func (s *Scheduler) Every(interval time.Duration) *Job {
+	job := NewJob(interval)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.jobs = append(s.jobs, job)
+
 	return job
 }
 
-// RunPending runs all the jobs that are scheduled to run.
-func (s *Scheduler) RunPending() {
-	jobs := s.getRunnableJobs()
-	if jobs != nil {
-		for _, j := range jobs {
-			go j.run()
-			j.lastRun = time.Now()
-			j.scheduleNextRun()
+// runPending runs all the jobs that are scheduled to run.
+func (s *Scheduler) runPending() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var onceJobs []*Job
+	jobs := s.runnableJobs()
+	for _, j := range jobs {
+		go j.run()
+		j.lastRun = time.Now()
+		j.scheduleNextRun()
+		if j.once {
+			onceJobs = append(onceJobs, j)
 		}
+	}
+	for _, j := range onceJobs {
+		s.RemoveByRef(j)
 	}
 }
 
@@ -97,11 +142,13 @@ func (s *Scheduler) RunAll() {
 }
 
 // RunAllwithDelay runs all jobs with delay seconds
-func (s *Scheduler) RunAllwithDelay(d int) {
-	for i := 0; i < s.size; i++ {
-		go s.jobs[i].run()
+func (s *Scheduler) RunAllwithDelay(d time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, job := range s.jobs {
+		go job.run()
 		if 0 != d {
-			time.Sleep(time.Duration(d))
+			time.Sleep(d)
 		}
 	}
 }
@@ -120,35 +167,31 @@ func (s *Scheduler) RemoveByRef(j *Job) {
 	})
 }
 
-func (s *Scheduler) removeByCondition(shouldRemove func(*Job) bool) {
-	i := 0
-
-	// keep deleting until no more jobs match the criteria
-	for {
-		found := false
-
-		for ; i < s.size; i++ {
-			if shouldRemove(s.jobs[i]) {
-				found = true
-				break
+func (s *Scheduler) RemoveByTag(tag string) {
+	s.removeByCondition(func(j *Job) bool {
+		for idx, _ := range j.tags {
+			if j.tags[idx] == tag {
+				return true
 			}
 		}
+		return false
+	})
+}
 
-		if !found {
-			return
+func (s *Scheduler) removeByCondition(shouldRemove func(*Job) bool) {
+	retainedJobs := make([]*Job, 0)
+	for _, job := range s.jobs {
+		if !shouldRemove(job) {
+			retainedJobs = append(retainedJobs, job)
 		}
-
-		for j := (i + 1); j < s.size; j++ {
-			s.jobs[i] = s.jobs[j]
-			i++
-		}
-		s.size--
-		s.jobs[s.size] = nil
 	}
+	s.jobs = retainedJobs
 }
 
 // Scheduled checks if specific job j was already added
 func (s *Scheduler) Scheduled(j interface{}) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, job := range s.jobs {
 		if job.jobFunc == getFunctionName(j) {
 			return true
@@ -159,92 +202,11 @@ func (s *Scheduler) Scheduled(j interface{}) bool {
 
 // Clear delete all scheduled jobs
 func (s *Scheduler) Clear() {
-	for i := 0; i < s.size; i++ {
-		s.jobs[i] = nil
-	}
-	s.size = 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.jobs = make([]*Job, 0)
 }
 
-// Start all the pending jobs
-// Add seconds ticker
-func (s *Scheduler) Start() chan bool {
-	stopped := make(chan bool, 1)
-	ticker := time.NewTicker(1 * time.Second)
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				s.RunPending()
-			case <-stopped:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-
-	return stopped
-}
-
-// The following methods are shortcuts for not having to
-// create a Scheduler instance
-
-// Every schedules a new periodic job running in specific interval
-func Every(interval uint64) *Job {
-	return defaultScheduler.Every(interval)
-}
-
-// RunPending run all jobs that are scheduled to run
-//
-// Please note that it is *intended behavior that run_pending()
-// does not run missed jobs*. For example, if you've registered a job
-// that should run every minute and you only call run_pending()
-// in one hour increments then your job won't be run 60 times in
-// between but only once.
-func RunPending() {
-	defaultScheduler.RunPending()
-}
-
-// RunAll run all jobs regardless if they are scheduled to run or not.
-func RunAll() {
-	defaultScheduler.RunAll()
-}
-
-// RunAllwithDelay run all the jobs with a delay in seconds
-//
-// A delay of `delay` seconds is added between each job. This can help
-// to distribute the system load generated by the jobs more evenly over
-// time.
-func RunAllwithDelay(d int) {
-	defaultScheduler.RunAllwithDelay(d)
-}
-
-// Start run all jobs that are scheduled to run
-func Start() chan bool {
-	return defaultScheduler.Start()
-}
-
-// Clear all scheduled jobs
-func Clear() {
-	defaultScheduler.Clear()
-}
-
-// Remove a specific job
-func Remove(j interface{}) {
-	defaultScheduler.Remove(j)
-}
-
-// Scheduled checks if specific job j was already added
-func Scheduled(j interface{}) bool {
-	for _, job := range defaultScheduler.jobs {
-		if job.jobFunc == getFunctionName(j) {
-			return true
-		}
-	}
-	return false
-}
-
-// NextRun gets the next running time
-func NextRun() (job *Job, time time.Time) {
-	return defaultScheduler.NextRun()
+func (s *Scheduler) shouldRun(j *Job) bool {
+	return time.Now().After(j.nextRun)
 }
