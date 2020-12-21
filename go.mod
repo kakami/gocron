@@ -1,5 +1,5 @@
-module github.com/Messier78/gocron
+module github.com/kakami/gocron
 
-go 1.14
+go 1.15
 
-require golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
+require golang.org/x/sync v0.0.0-20201207232520-09787c993a3a

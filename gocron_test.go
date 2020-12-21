@@ -12,7 +12,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/Messier78/gocron"
+	"github.com/kakami/gocron"
 )
 
 func Test_gocron(t *testing.T) {
